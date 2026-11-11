@@ -543,11 +543,13 @@ Where the crate handles key material or secrets:
 
 ## Validation
 
-- CI runs one job, `Markdown`: `markdownlint-cli2 "**/*.md"`, then the
-  shared instruction-block drift check, which fails when the generated
-  regions of this file stop matching the release
-  `.agent-instructions.toml` pins. Run `markdownlint-cli2 "**/*.md"`
-  locally before pushing a change to a Markdown file.
+- CI runs two jobs. `Markdown` runs `markdownlint-cli2` with no glob
+  of its own, so the root `.markdownlint-cli2.yaml` alone decides which
+  files are linted, then the shared instruction-block drift check,
+  which fails when the generated regions of this file stop matching the
+  release `.agent-instructions.toml` pins. `CI Gate` fails unless every
+  other job passed or was skipped. Run `markdownlint-cli2`, with no
+  arguments, locally before pushing a change to a Markdown file.
 - There is no Rust code yet, so there are no `cargo fmt` or
   `cargo clippy` invocations. The pull request that adds the first crate
   adds its CI jobs and names their exact invocations here.

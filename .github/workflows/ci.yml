@@ -8,6 +8,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && '-dispatch' || (github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '') }}
+  cancel-in-progress: true
+
 # Read-only. The lint reads the checkout, and the drift check reads the
 # pin and the upstream release.
 permissions:
@@ -21,9 +25,7 @@ jobs:
       - uses: actions/checkout@v5
         id: checkout
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v24
-        with:
-          globs: '**/*.md'
+        uses: DavidAnson/markdownlint-cli2-action@v25
 
       # Fails when this repository's copy of the shared instruction blocks
       # stops matching the release `.agent-instructions.toml` pins --
@@ -43,3 +45,26 @@ jobs:
       - name: Check shared instruction-block drift
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         uses: aicers/agent-instructions/check-drift@main
+
+  gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs: [markdown]
+    if: ${{ always() }}
+    steps:
+      - name: Assert every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "${RESULTS}"
+          bad="$(printf '%s' "${RESULTS}" \
+            | jq -r 'to_entries[]
+                     | select(.value.result != "success" and .value.result != "skipped")
+                     | "  \(.key): \(.value.result)"')"
+          if [ -n "${bad}" ]; then
+            echo "Not green:" >&2
+            echo "${bad}" >&2
+            exit 1
+          fi
