@@ -5,12 +5,9 @@ name: Changelog
 # only in the pull request it opens, so a hand edit elsewhere would
 # conflict with it or be lost.
 #
-# A release pull request is one whose author, the account that opened
-# it, is `github-actions[bot]`, from a branch of this repository whose
-# name starts with `release-plz-`, into `main`: anyone can name a branch
-# `release-plz-`. `release-plz.yml` goes by the same test. Who pushed its
-# latest commit does not matter, so a release pull request a person
-# pushed a commit to still passes. There is no label exception.
+# A release pull request is one whose head branch starts with
+# `release-plz-` and whose author is `github-actions[bot]`, both: anyone
+# can name a branch `release-plz-`. There is no label exception.
 #
 # `pull_request_target` with `pull-requests: read` only. It reads the
 # changed files from the API and checks out nothing, so no code from the
@@ -37,8 +34,6 @@ jobs:
           CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           files="${RUNNER_TEMP}/changed-files.jsonl"
@@ -63,8 +58,7 @@ jobs:
             exit 0
           fi
           printf '%s\n' "${touched}"
-          if [[ "${HEAD_REF}" == release-plz-* ]] && [ "${AUTHOR}" = "github-actions[bot]" ] \
-            && [ "${HEAD_REPO}" = "${GITHUB_REPOSITORY}" ] && [ "${BASE_REF}" = "main" ]; then
+          if [[ "${HEAD_REF}" == release-plz-* ]] && [ "${AUTHOR}" = "github-actions[bot]" ]; then
             echo "This is the release pull request, which release-plz writes CHANGELOG.md in."
             exit 0
           fi
