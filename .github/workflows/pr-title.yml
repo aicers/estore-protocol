@@ -9,6 +9,9 @@ name: PR title
 # base only, never the pull request's head, and runs no code from it; the
 # title reaches the action as an input, never through `${{ }}` in `run:`.
 #
+# Only pull requests into `main`: the title of one into another branch
+# never becomes a commit title on `main`.
+#
 # The release pull request starts no workflow, since it is opened with
 # GITHUB_TOKEN; `release-plz.yml` posts this check on it as a commit
 # status of the same name.
@@ -16,6 +19,7 @@ name: PR title
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened]
+    branches: [main]
 
 permissions: {}
 
