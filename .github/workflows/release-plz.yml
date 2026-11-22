@@ -1,0 +1,569 @@
+name: Release-plz
+
+# Releases with release-plz, configured in `release-plz.toml`.
+#
+# `release` tags `X.Y.Z` and creates the GitHub Release
+# `estore-protocol X.Y.Z` when the commit it runs on is the merge of a
+# release pull request, and does nothing otherwise. `release-pr` then
+# opens the release pull request, or updates the one that is open, from
+# every commit since the last `X.Y.Z` tag.
+#
+# TRIGGERS: a `workflow_run` of CI on `main`, acting only on a run that
+# passed on a push, so nothing here ever runs on a commit CI has not
+# passed and nothing here runs CI again. `workflow_dispatch` acts on
+# `main`'s head, and only when dispatched on `main`.
+#
+# NO PACKAGE YET: while the checked-out tree has no root Cargo.toml,
+# neither release-plz command runs. Both jobs end successfully after the
+# checkout and say so, and no `Validate PR title` status is posted. The
+# pull request that adds the first crate needs no change here.
+#
+# A RELEASE PULL REQUEST is one opened by `github-actions[bot]` from a
+# `release-plz-` branch of this repository into `main`, the same test
+# `changelog.yml` makes. release-plz 0.4.3 itself goes by the branch
+# prefix alone: it releases a commit that came from any pull request
+# with a `release-plz-` branch, and closes or rewrites any open one. So
+# `release` runs release-plz only on the merge of a release pull request,
+# and `release-pr` refuses to run while an open pull request has a
+# `release-plz-` branch and is not one.
+#
+# A RELEASE MERGE IS RELEASED ONLY BY THE RUN FOR IT. CI cancels its run
+# on `main` when another push arrives, and GitHub keeps at most one run
+# waiting in the `release` concurrency group, cancelling the older one,
+# so a merge landing soon after a release merge can take that run away.
+# Hold other merges until the release's tag and GitHub Release exist. A
+# run that finds a release merge with no tag on its second parent, or a
+# tag with no GitHub Release, fails and says how to recover, so a lost or
+# half-made release is never silent.
+#
+# The release pull request is opened with GITHUB_TOKEN, so it starts no
+# workflow: no CI and no changelog check run on it by themselves. The
+# `title` job below posts the `Validate PR title` status on it instead.
+
+on:
+  workflow_run:
+    # The `name:` of ci.yml, which is what `workflow_run` matches.
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    if: >-
+      ${{
+        (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push')
+        || (github.event_name == 'workflow_dispatch'
+          && github.ref == 'refs/heads/main')
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      # Pushes the tag and creates the GitHub Release.
+      contents: write
+      # Looks up the pull request a commit came from, to tell a release
+      # pull request's merge from any other commit.
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      # The commit CI passed on, detached; `main` as checked out on a
+      # dispatch. The full history and the tags, from which release-plz
+      # finds the last release. No credentials in `.git/config`:
+      # release-plz pushes with the token it is given below, and the cargo
+      # builds it runs have no use for one.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'refs/heads/main' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: sha
+        name: Record the commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: package
+        name: Check for a package
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No package yet: this commit has no root Cargo.toml, so release-plz release does not run."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Left to itself, release-plz would release this commit if any pull
+      # request it came from has a `release-plz-` branch, so a person's
+      # pull request from such a branch would be tagged and released at
+      # its Cargo.toml version before a release pull request wrote the
+      # changelog section. It runs only when there is at least one such
+      # pull request and every one of them is a release pull request.
+      #
+      # A release merge can also lose the one run that would release it:
+      # CI cancels its run on `main` when another push arrives, and
+      # GitHub cancels a run waiting in the `release` concurrency group
+      # when a newer one joins it. Or the run creates the tag and then
+      # fails to create the GitHub Release, and a re-run skips the version
+      # because its tag exists. Neither can be prevented from here, so
+      # every run checks every release merge on main's first-parent path
+      # since the last release, this commit's included: each must have an
+      # `X.Y.Z` tag on its second parent, where release-plz puts it, and a
+      # GitHub Release for that tag. A tag missing anywhere but on this
+      # commit's own release merge, which this run releases, or a tag
+      # with no Release fails the run before release-plz runs, saying how
+      # to recover. That also stops `release-pr` from building a release
+      # pull request over a release that was never made.
+      - id: merged
+        name: Check that the commit merged a release pull request
+        if: ${{ steps.package.outputs.present == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Writes `release`, `other` or `none` to the file $2 names: whether
+          # commit $1 came from release pull requests only, from a
+          # `release-plz-` pull request that is not one, or from neither.
+          # Warnings for the second case go to the file $3 names.
+          classify() {
+            local prs="${RUNNER_TEMP}/associated-prs.jsonl" others
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/$1/pulls?per_page=100" \
+              --jq '.[] | select(.head.ref | startswith("release-plz-"))
+                | {number, author: .user.login, head_repo: .head.repo.full_name,
+                   base_repo: .base.repo.full_name, base: .base.ref, merged: (.merged_at != null)}' > "${prs}"
+            # Logins and repository names come from the API, so they are
+            # printed only as JSON strings.
+            others="$(jq -s -r --arg repo "${GITHUB_REPOSITORY}" '.[]
+              | select((.author == "github-actions[bot]" and .head_repo == $repo
+                  and .base_repo == $repo and .base == "main" and .merged) | not)
+              | "Pull request \(.number) has a release-plz- branch but is not a release pull request: author \(.author | @json), head repository \(.head_repo | @json), base \(.base | @json)."' "${prs}")"
+            if [ -n "${others}" ]; then
+              printf '%s\n' "${others}" > "$3"
+              echo other > "$2"
+            elif [ "$(jq -s length "${prs}")" = 0 ]; then
+              echo none > "$2"
+            else
+              jq -s -r 'map(.number) | join(", ")' "${prs}" > "$3"
+              echo release > "$2"
+            fi
+          }
+          kind="${RUNNER_TEMP}/kind"
+          detail="${RUNNER_TEMP}/detail"
+          classify "${SHA}" "${kind}" "${detail}"
+          release_head=false
+          case "$(cat "${kind}")" in
+            release)
+              echo "This commit merged release pull request $(cat "${detail}")."
+              release_head=true
+              ;;
+            other)
+              while IFS= read -r line; do echo "::warning::${line}"; done < "${detail}"
+              echo "Not releasing: release-plz would take a pull request that is not a release pull request for one."
+              ;;
+            none)
+              echo "Not releasing: this commit is not the merge of a release pull request."
+              ;;
+          esac
+          # release-plz 0.4.3 tags the last commit of the release pull
+          # request, which is the merge's second parent, not the merge. A tag
+          # on the merge itself, made by hand, counts too. Git output is
+          # captured first, so that a failing git command fails the step
+          # rather than leaving the loops below with nothing to read.
+          tag_list="$(git tag -l)"
+          tags=()
+          while IFS= read -r tag; do
+            if [[ "${tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              tags+=("refs/tags/${tag}^@")
+            fi
+          done <<< "${tag_list}"
+          # Every merge on main's first-parent path that no parent of an
+          # X.Y.Z-tagged commit reaches, this commit included. The boundary
+          # is the tagged commits' parents, not the tagged commits, so that
+          # a release merge carrying its own tag is still checked for its
+          # GitHub Release. A release merge stays in the list until the
+          # next release, wherever its tag is.
+          merges="$(git rev-list --first-parent --min-parents=2 "${SHA}" --not ${tags[@]+"${tags[@]}"})"
+          missed=()
+          partial=()
+          while IFS= read -r merge; do
+            if [ -z "${merge}" ]; then
+              continue
+            fi
+            classify "${merge}" "${kind}" "${detail}"
+            if [ "$(cat "${kind}")" != release ]; then
+              continue
+            fi
+            head="$(git rev-parse "${merge}^2")"
+            found="$( { git tag --points-at "${head}"; git tag --points-at "${merge}"; } \
+              | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -u)"
+            if [ -z "${found}" ]; then
+              # This commit's own release merge is released by this run.
+              if [ "${merge}" != "${SHA}" ]; then
+                missed+=("${merge}")
+              fi
+              continue
+            fi
+            while IFS= read -r tag; do
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .tag_name > /dev/null 2> "${RUNNER_TEMP}/release-error"; then
+                continue
+              fi
+              if ! grep -q 'HTTP 404' "${RUNNER_TEMP}/release-error"; then
+                cat "${RUNNER_TEMP}/release-error" >&2
+                echo "::error::Could not look up the GitHub Release for tag ${tag}."
+                exit 1
+              fi
+              partial+=("${merge} ${tag}")
+            done <<< "${found}"
+          done <<< "${merges}"
+          for merge in ${missed[@]+"${missed[@]}"}; do
+            echo "::error::${merge} merged a release pull request, but no X.Y.Z tag is on it or on its second parent: its release run was cancelled or did not finish."
+          done
+          for entry in ${partial[@]+"${partial[@]}"}; do
+            echo "::error::${entry% *} merged a release pull request and has the tag ${entry#* }, but no GitHub Release for that tag: its release run created the tag and then failed."
+          done
+          if [ "${#missed[@]}" -gt 0 ] || [ "${#partial[@]}" -gt 0 ]; then
+            # A workflow_run run is listed under main's head when GitHub
+            # created it, not under the commit it checks out, so it cannot
+            # be found by that commit. Re-running the CI push run for the
+            # commit starts a new Release-plz run that checks it out.
+            echo "To recover, hold other merges. Each commit named above is released again by re-running its CI push run (gh run list --workflow CI --commit <SHA> --event push, then gh run rerun <run>), even if it passed: the Release-plz run it then starts checks that commit out, and a later push does not cancel a re-run CI run. Do not look for the Release-plz run by the commit: GitHub lists a workflow_run run under main's head when it was created, which may be a later commit."
+          fi
+          if [ "${#missed[@]}" -gt 0 ]; then
+            echo "For a merge with no tag, re-run its CI push run as described: the Release-plz run it starts creates the tag and the GitHub Release."
+          fi
+          if [ "${#partial[@]}" -gt 0 ]; then
+            echo "For a tag without a GitHub Release, delete the tag first (gh api -X DELETE repos/${GITHUB_REPOSITORY}/git/refs/tags/<TAG>; nothing was published from it), because release-plz skips a version whose tag exists, then re-run the commit's CI push run as described, even if it passed: the Release-plz run it starts creates the tag and the GitHub Release again."
+          fi
+          if [ "${#missed[@]}" -gt 0 ] || [ "${#partial[@]}" -gt 0 ]; then
+            echo "Once every tag and GitHub Release exists, run this workflow on main (workflow_dispatch) to bring the release pull request up to date, and lift the hold."
+            exit 1
+          fi
+          echo "release=${release_head}" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        if: ${{ steps.merged.outputs.release == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+      - name: Release
+        if: ${{ steps.merged.outputs.release == 'true' }}
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+          version: 0.4.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-pr:
+    name: Release PR
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      # Pushes the release branch.
+      contents: write
+      # Opens, updates or closes the release pull request.
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release-plz.outputs.prs_created }}
+      pr: ${{ steps.release-plz.outputs.pr }}
+      # The release pull requests open when `live` checked, for `title`.
+      seen: ${{ steps.live.outputs.seen }}
+    steps:
+      # release-pr refuses a detached HEAD and takes the release pull
+      # request's base from the checked-out branch, so this is the branch
+      # `main`, not the commit `release` ran on.
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      # Only while the commit `release` ran on is still `main`'s head. A
+      # run for a commit `main` has since moved past would rebuild the
+      # release pull request from stale history; the run for the newest
+      # commit, which waits behind this one, does it instead. Then only
+      # when that tree has a package at all.
+      - id: head
+        name: Check that the commit is still main's head
+        env:
+          EXPECTED: ${{ needs.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [ -z "${EXPECTED}" ]; then
+            echo "::error::The release job did not report the commit it ran on."
+            exit 1
+          fi
+          if [ "${head}" != "${EXPECTED}" ]; then
+            echo "Skipping release-pr: this run is for ${EXPECTED}, but main's head is now ${head}."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          elif [ ! -f Cargo.toml ]; then
+            echo "No package yet: main has no root Cargo.toml, so release-plz release-pr does not run."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust
+        if: ${{ steps.head.outputs.current == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+      # Checked again on GitHub, after the slow steps and as close to
+      # release-plz as the action allows, as the step above reads only
+      # the checkout. release-plz closes every open pull request whose
+      # branch starts with `release-plz-` but one, and rebuilds and
+      # force-pushes that one or replaces it, whoever opened it and from
+      # whichever repository; so it does not run while such a pull
+      # request is not a release pull request, and this fails to say so
+      # until a maintainer closes that pull request. Then main's head
+      # last: once main has moved, the run for the newest commit updates
+      # the release pull request instead.
+      #
+      # The action still installs its tools before release-plz lists the
+      # open pull requests, and nothing here can run in between. What
+      # changes in that window is caught afterwards: by `title`, from the
+      # release pull requests recorded here as `seen`, and by the last
+      # step below, from the time recorded here as `checked_at`.
+      - id: live
+        name: Check the open pull requests and main's head on GitHub
+        if: ${{ steps.head.outputs.current == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED: ${{ needs.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # From before the open pull requests are listed, less a minute
+          # for the runner's clock, so the last step can find the pull
+          # requests release-plz closed after this check.
+          echo "checked_at=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          prs="${RUNNER_TEMP}/open-prs.jsonl"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" \
+            --jq '.[] | select(.head.ref | startswith("release-plz-"))
+              | {number, author: .user.login, head_repo: .head.repo.full_name, base: .base.ref}' > "${prs}"
+          jq -s -r --arg repo "${GITHUB_REPOSITORY}" 'map(select(.author == "github-actions[bot]"
+              and .head_repo == $repo and .base == "main") | .number) | "seen=\(join(" "))"' "${prs}" >> "$GITHUB_OUTPUT"
+          # Logins and repository names come from the API, so they are
+          # printed only as JSON strings.
+          others="$(jq -s -r --arg repo "${GITHUB_REPOSITORY}" '.[]
+            | select((.author == "github-actions[bot]" and .head_repo == $repo and .base == "main") | not)
+            | "Open pull request \(.number) has a release-plz- branch but is not a release pull request: author \(.author | @json), head repository \(.head_repo | @json), base \(.base | @json). Close it, or rename its branch, so release-plz leaves the release pull request alone."' "${prs}")"
+          if [ -n "${others}" ]; then
+            while IFS= read -r line; do echo "::error::${line}"; done <<< "${others}"
+            exit 1
+          fi
+          live="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [ "${live}" != "${EXPECTED}" ]; then
+            echo "Skipping release-pr: this run is for ${EXPECTED}, but main's head on GitHub is now ${live}."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
+      - id: release-plz
+        name: Release PR
+        if: ${{ steps.live.outputs.current == 'true' }}
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+          version: 0.4.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Whenever release-plz was invoked, whether it succeeded or not:
+      # release-plz 0.4.3 closes the other open `release-plz-` pull
+      # requests before it creates or updates the one it returns, so a
+      # run that fails afterwards, or returns a pull request `title`
+      # rejects, can still have closed one. The window between `live`
+      # and release-plz listing the open pull requests cannot be closed
+      # from here: a pull request with a `release-plz-` branch opened in
+      # it can be closed, or taken for the release pull request and
+      # rewritten, by release-plz. This step cannot prevent or undo that;
+      # it reports it, failing the job, so the author can open the pull
+      # request again from another branch.
+      - id: audit
+        name: Check what release-plz closed
+        if: ${{ !cancelled() && steps.live.outputs.current == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SINCE: ${{ steps.live.outputs.checked_at }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${SINCE}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            echo "::error::The live step did not record when it checked the open pull requests."
+            exit 1
+          fi
+          # Closed pull requests, most recently updated first, until one
+          # was last updated before the check. Timestamps in this form
+          # sort as strings.
+          closed="${RUNNER_TEMP}/closed-prs.jsonl"
+          : > "${closed}"
+          page=1
+          while :; do
+            batch="$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}")"
+            jq -c --arg since "${SINCE}" --arg repo "${GITHUB_REPOSITORY}" '.[]
+              | select(.closed_at != null and .closed_at >= $since
+                  and .merged_at == null and (.head.ref | startswith("release-plz-"))
+                  and ((.user.login == "github-actions[bot]" and .head.repo.full_name == $repo
+                    and .base.ref == "main") | not))
+              | {number, author: .user.login, head_repo: .head.repo.full_name, head: .head.ref, base: .base.ref}' <<< "${batch}" >> "${closed}"
+            oldest="$(jq -r 'last | .updated_at // ""' <<< "${batch}")"
+            if [ "$(jq length <<< "${batch}")" -lt 100 ] || [[ "${oldest}" < "${SINCE}" ]]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+          collateral=false
+          while IFS= read -r pr; do
+            if [ -z "${pr}" ]; then
+              continue
+            fi
+            number="$(jq -r .number <<< "${pr}")"
+            closer="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${number}/events?per_page=100" \
+              --jq '.[] | select(.event == "closed") | .actor.login' | tail -n 1)"
+            if [ "${closer}" != "github-actions[bot]" ]; then
+              continue
+            fi
+            # Logins, repository and branch names come from the API, so they
+            # are printed only as JSON strings.
+            jq -r '"::error::release-plz closed pull request \(.number), which has a release-plz- branch but is not a release pull request: author \(.author | @json), head repository \(.head_repo | @json), head branch \(.head | @json), base \(.base | @json). It opened after this run checked the open pull requests. Open it again from a branch that does not start with release-plz-, which release-plz leaves alone."' <<< "${pr}"
+            collateral=true
+          done < "${closed}"
+          # `live` failed on any such pull request open at the check, so one
+          # open now was opened since, and release-plz may have taken it for
+          # the release pull request and rewritten its branch.
+          open="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" \
+            --jq '.[] | select(.head.ref | startswith("release-plz-"))
+              | {number, author: .user.login, head_repo: .head.repo.full_name, head: .head.ref, base: .base.ref}')"
+          others="$(jq -s -r --arg repo "${GITHUB_REPOSITORY}" '.[]
+            | select((.author == "github-actions[bot]" and .head_repo == $repo and .base == "main") | not)
+            | "::error::Open pull request \(.number) has a release-plz- branch but is not a release pull request: author \(.author | @json), head repository \(.head_repo | @json), head branch \(.head | @json), base \(.base | @json). It opened after this run checked the open pull requests, and release-plz may have rewritten its branch. Close it and open it again from a branch that does not start with release-plz-."' <<< "${open}")"
+          if [ -n "${others}" ]; then
+            printf '%s\n' "${others}"
+            collateral=true
+          fi
+          if [ "${collateral}" = true ]; then
+            exit 1
+          fi
+          echo "release-plz closed no pull request that is not a release pull request, and no such pull request is open."
+
+  # The release pull request starts no workflow, so `pr-title.yml` never
+  # checks it. This posts the same check as a commit status of the same
+  # name on its head, which is what the required check reads. release-plz
+  # reports the pull request it created or updated, and nothing when it
+  # did neither, or did not run.
+  #
+  # First it checks what release-plz acted on, which `live` could not see:
+  # that pull request must be a release pull request, and no release pull
+  # request `live` saw open may have been merged since, as one built from
+  # history before that merge would release it a second time. Either
+  # fails the job and posts no status, so that pull request cannot be
+  # merged. It runs even when `release-pr` failed only on its last step,
+  # the report of what release-plz closed, which says nothing about the
+  # release pull request.
+  title:
+    name: Check release PR title
+    needs: [release, release-pr]
+    if: ${{ !cancelled() && needs.release-pr.outputs.created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # The checkout, which holds the pin the rule is read at.
+      contents: read
+      # Reads the release pull request's title and head.
+      pull-requests: read
+      # Posts `Validate PR title`.
+      statuses: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          persist-credentials: false
+      - id: pr
+        name: Read the release pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ fromJSON(needs.release-pr.outputs.pr).number }}
+          SEEN: ${{ needs.release-pr.outputs.seen }}
+          EXPECTED: ${{ needs.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          case "${NUMBER}" in
+            '' | *[!0-9]*)
+              echo "::error::release-plz reported no release pull request number."
+              exit 1
+              ;;
+          esac
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}")"
+          # Logins, repository and branch names come from the API, so they
+          # are printed only as JSON strings.
+          identity="$(jq -r --arg repo "${GITHUB_REPOSITORY}" '
+            if .user.login == "github-actions[bot]" and .head.repo.full_name == $repo
+              and .base.ref == "main" and (.head.ref | startswith("release-plz-"))
+            then "release"
+            else "author \(.user.login | @json), head repository \(.head.repo.full_name | @json), head branch \(.head.ref | @json), base \(.base.ref | @json)"
+            end' <<< "${pr}")"
+          if [ "${identity}" != release ]; then
+            echo "::error::release-plz acted on pull request ${NUMBER}, which is not a release pull request: ${identity}. It opened after this run checked the open pull requests. Close it, then run this workflow on main (workflow_dispatch)."
+            exit 1
+          fi
+          stale=false
+          for seen in ${SEEN}; do
+            case "${seen}" in
+              '' | *[!0-9]*)
+                echo "::error::The release-pr job reported a pull request number that is not a number."
+                exit 1
+                ;;
+            esac
+            if [ "${seen}" = "${NUMBER}" ]; then
+              continue
+            fi
+            state="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${seen}" --jq 'if .merged_at != null then "merged" else .state end')"
+            if [ "${state}" = merged ]; then
+              echo "::error::Release pull request ${seen} was merged while this run rebuilt the release pull request from ${EXPECTED}, which is older than that merge, so pull request ${NUMBER} would release it again. Close pull request ${NUMBER}; the next change on main opens the next release pull request."
+              stale=true
+            elif [ "${state}" = closed ]; then
+              echo "::warning::Release pull request ${seen} was closed and replaced by pull request ${NUMBER}."
+            fi
+          done
+          if [ "${stale}" = true ]; then
+            exit 1
+          fi
+          live="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [ "${live}" != "${EXPECTED}" ]; then
+            echo "main moved from ${EXPECTED} to ${live} while release-plz ran. Pull request ${NUMBER} releases main as of ${EXPECTED}, which CI passed, until a run for a newer commit whose CI passed brings it up to date."
+          fi
+          sha="$(jq -r .head.sha <<< "${pr}")"
+          if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not read the head of pull request ${NUMBER}."
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          # As a JSON string, so a line break in the title cannot end the
+          # output early; the check below fails a title holding one.
+          echo "title=$(jq -c .title <<< "${pr}")" >> "$GITHUB_OUTPUT"
+      - id: check
+        name: Check the title
+        continue-on-error: true
+        uses: aicers/agent-instructions/conventional-title@main
+        with:
+          title: ${{ fromJSON(steps.pr.outputs.title) }}
+      - name: Post Validate PR title
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          OUTCOME: ${{ steps.check.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "${OUTCOME}" = "success" ]; then
+            state=success
+            description="The title is a Conventional title"
+          else
+            state=failure
+            description="The title is not a Conventional title"
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state="${state}" \
+            -f context="Validate PR title" \
+            -f description="${description}" \
+            -f target_url="${RUN_URL}" > /dev/null
+          echo "Posted Validate PR title: ${state} on ${SHA}"
+          [ "${state}" = "success" ]
